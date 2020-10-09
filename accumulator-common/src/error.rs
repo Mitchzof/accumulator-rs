@@ -16,6 +16,9 @@ pub enum AccumulatorErrorKind {
     /// An incorrect number of bytes was supplied when trying to deserialize from bytes
     #[fail(display = "Invalid bytes supplied when deserializing")]
     SerializationError,
+    /// Witness mismatch provided for aggregation
+    #[fail(display = "Mismatched witnesses provided for aggregation")]
+    WitMismatchError,
 }
 
 /// Error wrapper to add context and backtrace

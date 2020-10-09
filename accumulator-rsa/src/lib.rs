@@ -39,6 +39,7 @@ use blake2::{digest::Digest, Blake2b};
 use common::{
     bigint::BigInteger,
     error::{AccumulatorError, AccumulatorErrorKind},
+    Field,
 };
 use std::convert::TryFrom;
 use crate::hash::hash_to_generator;
@@ -50,6 +51,7 @@ pub mod prelude {
         common::{
             bigint::{BigInteger, GcdResult},
             error::*,
+            Field,
         },
         key::AccumulatorSecretKey,
         memproof::MembershipProof,
@@ -78,6 +80,117 @@ pub(crate) fn hashed_generator<B: AsRef<[u8]>>(u: &BigInteger, a: &BigInteger, n
 
     hash_to_generator(transcript.as_slice(), &n)
 }
+
+/// Shamir trick to aggregate two witnesses
+pub(crate) fn shamir_trick(w1: &BigInteger, w2: &BigInteger, x: &BigInteger, y: &BigInteger, f: &Field) -> Result<BigInteger, AccumulatorError> {
+    let wx = f.exp(w1, x);
+    let wy = f.exp(w2, y);
+
+    if wx != wy {
+        return Err(AccumulatorErrorKind::WitMismatchError.into());
+    }
+
+    let gcdres = x.bezouts_coefficients(y);
+    Ok(f.mul(&f.exp(w1, &gcdres.b), &f.exp(w2, &gcdres.a)))
+}
+
+/// Represents a Proof of Knowledge of Exponents 2 from section 3.2 in
+/// <https://eprint.iacr.org/2018/1188.pdf>
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub(crate) struct PoeProof {
+    u: BigInteger,
+    q: BigInteger,
+    r: BigInteger,
+}
+
+impl PoeProof {
+    /// The size of this proof serialized
+    pub const SIZE_BYTES: usize = 4 * FACTOR_SIZE + MEMBER_SIZE;
+
+    /// Create a new proof of exponentiation as described in
+    /// Appendix D from
+    /// <https://eprint.iacr.org/2018/1188.pdf>
+    pub fn new<B: AsRef<[u8]>>(
+        x: &BigInteger,
+        u: &BigInteger,
+        a: &BigInteger,
+        n: &BigInteger,
+        nonce: B,
+    ) -> Self {
+        let f = Field::new(n);
+        let l = Self::get_prime(&u, &a, nonce.as_ref());
+
+        // q = x / l
+        // r = x % l
+        let (whole, r) = BigInteger::div_rem(&x, &l);
+
+        // Q = u ^ q * g ^ {q * alpha}
+        let q = f.exp(&u, &whole);
+        Self {
+            u: u.clone(),
+            q,
+            r,
+        }
+    }
+
+    /// Verify a proof of knowledge of exponents
+    pub fn verify<B: AsRef<[u8]>>(&self, value: &BigInteger, n: &BigInteger, nonce: B) -> bool {
+        let nonce = nonce.as_ref();
+        let g = hashed_generator(&self.u, &value, &n, nonce);
+        self.check(&value, &n, nonce)
+    }
+
+    /// Same as `verify` but allow custom `g`
+    pub fn check<B: AsRef<[u8]>>(&self, value: &BigInteger, n: &BigInteger, nonce: B) -> bool {
+        let f = Field::new(n);
+        let nonce = nonce.as_ref();
+        let l = Self::get_prime(&self.u, &value, nonce);
+
+        // Q ^ l
+        // let p1 = f.exp(&self.q, &l);
+        // u ^ r
+        // let p2 = f.exp(&self.u, &self.r);
+        // Q^l * u^r
+        // let left = f.mul(&p1, &p2);
+        let left = f.mul(&f.exp(&self.q, &l), &f.exp(&self.u, &self.r));
+        let right = value.clone();
+
+        left == right
+    }
+
+    /// Serialize this to bytes
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut output = b2fa(&self.u, 2 * FACTOR_SIZE);
+        output.append(&mut b2fa(&self.q, 2 * FACTOR_SIZE));
+        output.append(&mut b2fa(&self.r, MEMBER_SIZE));
+        output
+    }
+
+    fn get_prime(u: &BigInteger, a: &BigInteger, nonce: &[u8]) -> BigInteger {
+        let mut data = u.to_bytes();
+        data.append(&mut a.to_bytes());
+        data.extend_from_slice(nonce);
+
+        // l = H2P( u || A || n1 )
+        hash_to_prime(data.as_slice())
+    }
+}
+
+impl TryFrom<&[u8]> for PoeProof {
+    type Error = AccumulatorError;
+
+    fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
+        if data.len() != Self::SIZE_BYTES {
+            return Err(AccumulatorErrorKind::SerializationError.into());
+        }
+        let u = BigInteger::try_from(&data[..(2 * FACTOR_SIZE)])?;
+        let q = BigInteger::try_from(&data[(2 * FACTOR_SIZE)..(2 * FACTOR_SIZE)])?;
+        let r = BigInteger::try_from(&data[(4 * FACTOR_SIZE)..])?;
+        Ok(Self { u, q, r })
+    }
+}
+
+serdes_impl!(PoeProof);
 
 /// Represents a Proof of Knowledge of Exponents 2 from section 3.2 in
 /// <https://eprint.iacr.org/2018/1188.pdf>
@@ -117,7 +230,7 @@ impl Poke2Proof {
         n: &BigInteger,
         nonce: B,
     ) -> Self {
-        let f = common::Field::new(n);
+        let f = Field::new(n);
         let z = f.exp(&g, x);
         let (l, alpha) = Self::get_prime_and_alpha(&u, &a, &z, nonce.as_ref());
 
@@ -144,7 +257,7 @@ impl Poke2Proof {
 
     /// Same as `verify` but allow custom `g`
     pub fn check<B: AsRef<[u8]>>(&self, g: &BigInteger, value: &BigInteger, n: &BigInteger, nonce: B) -> bool {
-        let f = common::Field::new(n);
+        let f = Field::new(n);
         let nonce = nonce.as_ref();
         let (l, alpha) = Self::get_prime_and_alpha(&self.u, &value, &self.z, nonce);
 
